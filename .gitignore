@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# R
+.Rproj.user/
+.Rhistory
+.RData
+# Secrets / local
+.env
+.Renviron
+*credentials*
+*secret*
+# OS
+.DS_Store
+# Data (never commit real records)
+*.xlsx
+*.csv
+data/raw/
