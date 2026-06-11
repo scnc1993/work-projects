@@ -1,761 +1,565 @@
-# ============================================================================
-# Build Unified Charter Roster — Multi-Tab Workbook (25-26)
-# Daquan Morrison · Data Analyst · Syracuse City School District
-# ----------------------------------------------------------------------------
-# SOURCE FILES (place all in the same folder as this script):
-#   southside_291462_unified-roster.xlsx
-#   sas_291463_unified-roster.xlsx
-#   sasccs_291464_unified-roster.xlsx
-#   ontech_final_unified-roster.xlsx
-#
-# HOW TO RUN ON YOUR DESKTOP:
-#   1. Put this script + all 4 xlsx files in the same folder
-#   2. Open terminal / command prompt in that folder
-#   3. Run: python build_unified_charter_roster_tabs.py
-#
-# REQUIREMENTS (install once):
-#   pip install pandas openpyxl xlsxwriter
-#
-# OUTPUT: all_charters_unified_roster_25-26_REBUILT.xlsx (5 tabs)
-#   Tab 1 — All Charters Unified     : master combined data (Student IDs patched from ST)
-#   Tab 2 — Formula Version          : NYSSIS lookup formulas vs Update Log
-#   Tab 3 — Copy & Paste             : plain values, paste into FY 25-26 master
-#   Tab 4 — Not Found in ST          : students with no NYSSIS / not in ST
-#   Tab 5 — Update Log               : 15 still-unresolved students pending manual lookup
-# ============================================================================
+"""
+rebuild_with_st_tab.py
+Daquan Morrison · Data Analyst · Syracuse City School District
 
-import os
-import sys
-import re
-import warnings
-import pandas as pd
-from datetime import date, datetime
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font, Alignment
-from openpyxl.formatting.rule import CellIsRule, FormulaRule
+Fixes:
+  1. NYSSIS=0/blank (4 SS rows) → patch from ST by name+DOB
+  2. Blank Last Name (4 SS rows where last = "0") → patch from ST
+  3. Blank Student Status (249 OnTech + 3 SS) → classify from ST dates
+  4. Blank School Name (3 SAS + 1 SASCCS) → patch from ST
+  5. Blank Student ID (5+ SASCCS) → patch from ST by NYSSIS
+  6. Add TAB 6: ST Enroll Export (combined all 4 charters, deduplicated)
+  7. Formula Version tab uses VLOOKUP against 'ST Enroll Export'!A:K
+"""
+import openpyxl, zipfile, os
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.dataframe import dataframe_to_rows
-
-warnings.filterwarnings("ignore")
-
-# ============================================================================
-# SETTINGS
-# ============================================================================
-SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR      = SCRIPT_DIR
-OUTPUT_PATH   = os.path.join(DATA_DIR, "all_charters_unified_roster_25-26_REBUILT.xlsx")
-INVOICE_MONTH = "2026-06-01"
-
-FILE_SOUTHSIDE = os.path.join(DATA_DIR, "southside_291462_unified-roster.xlsx")
-FILE_SAS       = os.path.join(DATA_DIR, "sas_291463_unified-roster.xlsx")
-FILE_SASCCS    = os.path.join(DATA_DIR, "sasccs_291464_unified-roster.xlsx")
-FILE_ONTECH    = os.path.join(DATA_DIR, "ontech_final_unified-roster.xlsx")
-
-TEMPLATE_COLS = [
-    "Charter_Source Ticket #", "Charter Month", "Source_File", "NYSSIS ID",
-    "Student ID", "Last Name", "First Name", "Grade Level", "DOB",
-    "School Name", "Enroll Date", "Withdraw Date", "SCSD FTE",
-    "Student Status", "Notes for Patrick", "SPED_Flag"
-]
-
-# ============================================================================
-# VERIFY FILES EXIST
-# ============================================================================
-for f in [FILE_SOUTHSIDE, FILE_SAS, FILE_SASCCS, FILE_ONTECH]:
-    if not os.path.exists(f):
-        print(f"ERROR: File not found -> {f}")
-        print("Make sure all 4 xlsx files are in the same folder as this script.")
-        sys.exit(1)
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-def clean_id(series):
-    s = series.astype(str).str.strip()
-    s = s.str.replace(r'\.0+$', '', regex=True)
-    s = s.replace(['nan','NaN','NULL','null','','None'], pd.NA)
-    return s
-
-def clean_fte(series):
-    s = series.astype(str).str.strip().str.replace('%', '', regex=False)
-    return pd.to_numeric(s, errors='coerce')
-
-def parse_date(series):
-    out = []
-    for v in series:
-        if pd.isna(v):
-            out.append(pd.NaT)
-            continue
-        if isinstance(v, (datetime, date)):
-            out.append(pd.Timestamp(v))
-            continue
-        s = str(v).strip()
-        if s in ('', 'nan', 'NaT', '0', 'NA', 'N/A', 'NULL'):
-            out.append(pd.NaT)
-            continue
-        # Excel serial number — valid 2020-2030 serials ~43831-49006
-        try:
-            num = float(s)
-            if 40000 < num < 80000:
-                out.append(pd.Timestamp('1899-12-30') + pd.Timedelta(days=int(num)))
-                continue
-        except:
-            pass
-        parsed = pd.NaT
-        for fmt in ('%m/%d/%Y','%Y-%m-%d','%d/%m/%Y','%m-%d-%Y'):
-            try:
-                parsed = pd.Timestamp(datetime.strptime(s, fmt))
-                break
-            except:
-                continue
-        out.append(parsed)
-    return pd.Series(out, index=series.index)
-
-def split_full_name(series):
-    last  = series.str.extract(r'^([^,]+)')[0].str.strip()
-    first = series.str.replace(r'^[^,]+,?\s*', '', regex=True).str.strip()
-    return last, first
-
-def normalize_str(series):
-    return series.astype(str).str.strip().replace(
-        ['nan','NaN','NULL','null','None',''], pd.NA)
-
-# ============================================================================
-# BUILD EACH CHARTER
-# ============================================================================
-def build_southside():
-    print("  Reading southside_291462_unified-roster.xlsx ...")
-    df = pd.read_excel(FILE_SOUTHSIDE, sheet_name="Unified Gen-SPED Roster", header=0, dtype=str)
-    df = df[df["NYSSIS ID"].notna() | df["Student Last Name"].notna()].copy()
-    return pd.DataFrame({
-        "Charter_Source Ticket #": "Southside 291462",
-        "Charter Month":           INVOICE_MONTH,
-        "Source_File":             "southside_291462_unified-roster.xlsx",
-        "NYSSIS ID":               clean_id(df["NYSSIS ID"]),
-        "Student ID":              clean_id(df["Student ID"]),
-        "Last Name":               normalize_str(df["Student Last Name"]),
-        "First Name":              normalize_str(df["Student First Name"]),
-        "Grade Level":             normalize_str(df["Grade"]),
-        "DOB":                     parse_date(df["Birth Date"]),
-        "School Name":             normalize_str(df["School Name"]),
-        "Enroll Date":             parse_date(df["Entered"]),
-        "Withdraw Date":           parse_date(df["Withdrew"]),
-        "SCSD FTE":                clean_fte(df["Southside FTE"]),
-        "Student Status":          normalize_str(df["Student Status"]),
-        "Notes for Patrick":       normalize_str(df["Notes for Patrick"]),
-        "SPED_Flag":               normalize_str(df["SPED_Flag"]),
-    })
-
-def build_sas():
-    print("  Reading sas_291463_unified-roster.xlsx ...")
-    df = pd.read_excel(FILE_SAS, sheet_name="Unified Gen-SPED Roster", header=0, dtype=str)
-    df = df[df["NYSSIS ID"].notna() | df["Last Name"].notna()].copy()
-    return pd.DataFrame({
-        "Charter_Source Ticket #": "SAS 291463",
-        "Charter Month":           INVOICE_MONTH,
-        "Source_File":             "sas_291463_unified-roster.xlsx",
-        "NYSSIS ID":               clean_id(df["NYSSIS ID"]),
-        "Student ID":              clean_id(df["Student ID"]),
-        "Last Name":               normalize_str(df["Last Name"]),
-        "First Name":              normalize_str(df["First Name"]),
-        "Grade Level":             normalize_str(df["Current Grade Level"]),
-        "DOB":                     parse_date(df["Date of Birth"]),
-        "School Name":             normalize_str(df["School Name"]),
-        "Enroll Date":             parse_date(df["Entry Date"]),
-        "Withdraw Date":           parse_date(df["Leave Date"]),
-        "SCSD FTE":                clean_fte(df["FTE"]),
-        "Student Status":          normalize_str(df["Student Status"]),
-        "Notes for Patrick":       pd.NA,
-        "SPED_Flag":               normalize_str(df["SPED_Flag"]),
-    })
-
-def build_sasccs():
-    print("  Reading sasccs_291464_unified-roster.xlsx ...")
-    df = pd.read_excel(FILE_SASCCS, sheet_name="Unified Gen-SPED Roster", header=0, dtype=str)
-    nyssis_col = df.columns[0]
-    full_name_col = df.columns[2]
-    df = df[df[nyssis_col].notna() | df[full_name_col].notna()].copy()
-    last, first = split_full_name(df["Full Name"])
-    return pd.DataFrame({
-        "Charter_Source Ticket #": "SASCCS 291464",
-        "Charter Month":           INVOICE_MONTH,
-        "Source_File":             "sasccs_291464_unified-roster.xlsx",
-        "NYSSIS ID":               clean_id(df["NYSSIS ID"]),
-        "Student ID":              clean_id(df["Student ID"]),
-        "Last Name":               last,
-        "First Name":              first,
-        "Grade Level":             normalize_str(df["Current Grade Level"]),
-        "DOB":                     parse_date(df["Date of Birth"]),
-        "School Name":             normalize_str(df["School Name"]),
-        "Enroll Date":             parse_date(df["Entry Date"]),
-        "Withdraw Date":           parse_date(df["Leave Date"]),
-        "SCSD FTE":                clean_fte(df["Status"]),
-        "Student Status":          normalize_str(df["Student Status"]),
-        "Notes for Patrick":       pd.NA,
-        "SPED_Flag":               normalize_str(df["SPED_Flag"]),
-    })
-
-def build_ontech():
-    print("  Reading ontech_final_unified-roster.xlsx ...")
-    df = pd.read_excel(FILE_ONTECH, sheet_name="Unified Gen-SPED Roster", header=0, dtype=str)
-    df = df[df["NYSSIS ID"].notna() | df["Last Name"].notna()].copy()
-    sid_col = "Studemt ID" if "Studemt ID" in df.columns else "Student ID"
-    return pd.DataFrame({
-        "Charter_Source Ticket #": "OnTech 291465",
-        "Charter Month":           INVOICE_MONTH,
-        "Source_File":             "ontech_final_unified-roster.xlsx",
-        "NYSSIS ID":               clean_id(df["NYSSIS ID"]),
-        "Student ID":              clean_id(df[sid_col]),
-        "Last Name":               normalize_str(df["Last Name"]),
-        "First Name":              normalize_str(df["First Name"]),
-        "Grade Level":             normalize_str(df["Grade Level"]),
-        "DOB":                     parse_date(df["DOB"]),
-        "School Name":             "OnTECH Charter High School",
-        "Enroll Date":             parse_date(df["Enroll Date"]),
-        "Withdraw Date":           parse_date(df["Withdraw Date"]),
-        "SCSD FTE":                clean_fte(df["OnTECH FTE"]),
-        "Student Status":          pd.NA,
-        "Notes for Patrick":       pd.NA,
-        "SPED_Flag":               normalize_str(df["SPED_Flag"]),
-    })
-
-# ============================================================================
-# COMBINE
-# ============================================================================
-print("\nBuilding unified roster...")
-unified = pd.concat([
-    build_southside(), build_sas(), build_sasccs(), build_ontech()
-], ignore_index=True)[TEMPLATE_COLS]
-
-for col in unified.select_dtypes(include="object").columns:
-    unified[col] = unified[col].replace(['nan','NaN','NULL','null','None',''], pd.NA)
-
-# ============================================================================
-# STEP: PATCH STUDENT IDs AND NYSSIS IDs FROM ST ENROLL REPORTS
-# Pass 1 — patch missing Student IDs  (NYSSIS/name/DOB → Student ID)
-# Pass 2 — patch missing NYSSIS IDs   (Student ID/name/DOB → NYSSIS)
-# ============================================================================
-print("\nPatching Student IDs and NYSSIS IDs from ST Enroll reports...")
-
-def load_st(filepath, sheet, source):
-    df = pd.read_excel(filepath, sheet_name=sheet, header=0, dtype=str)
-    return pd.DataFrame({
-        "nyssis": df["Student_UniversalStudentID"].astype(str).str.strip().str.replace(r'\.0+$','',regex=True).replace(['nan','NULL','','0'], pd.NA),
-        "sid":    df["StudentID"].astype(str).str.strip().str.replace(r'\.0+$','',regex=True).replace(['nan','NULL',''], pd.NA),
-        "fname":  df["FirstName"].astype(str).str.strip().str.upper().replace(['nan','NULL',''], pd.NA),
-        "lname":  df["LastName"].astype(str).str.strip().str.upper().replace(['nan','NULL',''], pd.NA),
-        "dob":    pd.to_datetime(df["Person_DOB"], errors='coerce'),
-        "school": df["SchoolName"].astype(str).str.strip().replace(['nan','NULL',''], pd.NA),
-        "source": source
-    })
-
-st_all = pd.concat([
-    load_st(FILE_SOUTHSIDE, "ST Enroll Export", "Southside ST"),
-    load_st(FILE_SAS,       "ST Enroll Export", "SAS ST"),
-    load_st(FILE_SASCCS,    "ST Enroll Export", "SASCCS ST"),
-    load_st(FILE_ONTECH,    "ST Enroll Export", "OnTech ST"),
-], ignore_index=True)
-
-# Build NYSSIS→SID and Name→SID lookup dicts
-nyssis_to_sid = {}
-for _, row in st_all[st_all["nyssis"].notna() & st_all["sid"].notna()].iterrows():
-    if row["nyssis"] not in nyssis_to_sid:
-        nyssis_to_sid[row["nyssis"]] = row["sid"]
-
-name_to_sid = {}  # key = (FNAME, LNAME)
-for _, row in st_all[st_all["fname"].notna() & st_all["lname"].notna() & st_all["sid"].notna()].iterrows():
-    key = (row["fname"], row["lname"])
-    if key not in name_to_sid:
-        name_to_sid[key] = row["sid"]
-
-lastdob_to_sid = {}  # key = (LNAME, DOB)
-for _, row in st_all[st_all["lname"].notna() & st_all["dob"].notna() & st_all["sid"].notna()].iterrows():
-    key = (row["lname"], row["dob"])
-    if key not in lastdob_to_sid:
-        lastdob_to_sid[key] = row["sid"]
-
-firstdob_counts = {}  # key = (FNAME, DOB) → count of unique SIDs
-for _, row in st_all[st_all["fname"].notna() & st_all["dob"].notna() & st_all["sid"].notna()].iterrows():
-    key = (row["fname"], row["dob"])
-    firstdob_counts.setdefault(key, set()).add(row["sid"])
-firstdob_to_sid = {k: list(v)[0] for k, v in firstdob_counts.items() if len(v) == 1}
-
-patch_count = 0
-for idx, row in unified.iterrows():
-    cur_sid = row["Student ID"]
-    if pd.notna(cur_sid) and cur_sid != "0":
-        continue
-
-    m_nyssis = str(row["NYSSIS ID"]).strip() if pd.notna(row["NYSSIS ID"]) else None
-    m_fname  = str(row["First Name"]).strip().upper() if pd.notna(row["First Name"]) and str(row["First Name"]) not in ("NA","nan","0") else None
-    m_lname  = str(row["Last Name"]).strip().upper()  if pd.notna(row["Last Name"])  and str(row["Last Name"])  not in ("NA","nan","0") else None
-    m_dob    = str(row["DOB"])[:10] if pd.notna(row["DOB"]) else None
-    if m_dob in ("NaT","nan","None",""): m_dob = None
-
-    found_sid = None
-
-    # Try 1: NYSSIS
-    if m_nyssis and m_nyssis not in ("nan","0","NA"):
-        found_sid = nyssis_to_sid.get(m_nyssis)
-
-    # Try 2: First + Last
-    if not found_sid and m_fname and m_lname and len(m_fname) > 1 and len(m_lname) > 1:
-        found_sid = name_to_sid.get((m_fname, m_lname))
-
-    # Try 3: Last + DOB
-    if not found_sid and m_lname and m_dob and len(m_lname) > 1:
-        found_sid = lastdob_to_sid.get((m_lname, m_dob))
-
-    # Try 4: First + DOB (unique match only)
-    if not found_sid and m_fname and m_dob and len(m_fname) > 1:
-        found_sid = firstdob_to_sid.get((m_fname, m_dob))
-
-    if found_sid:
-        unified.at[idx, "Student ID"] = found_sid
-        patch_count += 1
-
-still_missing_sid = int((unified["Student ID"].isna() | (unified["Student ID"] == "0")).sum())
-print(f"  Pass 1 — Student IDs patched from ST: {patch_count}")
-print(f"  Still missing Student IDs:            {still_missing_sid}")
-
-# ============================================================================
-# PASS 2 — Patch missing NYSSIS IDs from ST using Student ID / name / DOB
-# ============================================================================
-# Build SID→NYSSIS lookup from ST
-sid_to_nyssis = {}
-for _, row in st_all[st_all["sid"].notna() & st_all["nyssis"].notna()].iterrows():
-    if row["sid"] not in sid_to_nyssis:
-        sid_to_nyssis[row["sid"]] = row["nyssis"]
-
-name_to_nyssis = {}
-for _, row in st_all[st_all["fname"].notna() & st_all["lname"].notna() & st_all["nyssis"].notna()].iterrows():
-    key = (row["fname"], row["lname"])
-    if key not in name_to_nyssis:
-        name_to_nyssis[key] = row["nyssis"]
-
-lastdob_to_nyssis = {}
-for _, row in st_all[st_all["lname"].notna() & st_all["dob"].notna() & st_all["nyssis"].notna()].iterrows():
-    key = (row["lname"], row["dob"])
-    if key not in lastdob_to_nyssis:
-        lastdob_to_nyssis[key] = row["nyssis"]
-
-firstdob_nyssis_counts = {}
-for _, row in st_all[st_all["fname"].notna() & st_all["dob"].notna() & st_all["nyssis"].notna()].iterrows():
-    key = (row["fname"], row["dob"])
-    firstdob_nyssis_counts.setdefault(key, set()).add(row["nyssis"])
-firstdob_to_nyssis = {k: list(v)[0] for k, v in firstdob_nyssis_counts.items() if len(v) == 1}
-
-nyssis_patch_count = 0
-for idx, row in unified.iterrows():
-    cur_nyssis = row["NYSSIS ID"]
-    if pd.notna(cur_nyssis) and cur_nyssis != "0":
-        continue
-
-    m_sid   = str(row["Student ID"]).strip() if pd.notna(row["Student ID"]) and str(row["Student ID"]) not in ("nan","0","NA") else None
-    m_fname = str(row["First Name"]).strip().upper() if pd.notna(row["First Name"]) and str(row["First Name"]) not in ("NA","nan","0") else None
-    m_lname = str(row["Last Name"]).strip().upper()  if pd.notna(row["Last Name"])  and str(row["Last Name"])  not in ("NA","nan","0") else None
-    m_dob   = str(row["DOB"])[:10] if pd.notna(row["DOB"]) else None
-    if m_dob in ("NaT","nan","None",""): m_dob = None
-
-    found_nyssis = None
-
-    # Try 1: Student ID → NYSSIS
-    if m_sid:
-        found_nyssis = sid_to_nyssis.get(m_sid)
-
-    # Try 2: First + Last → NYSSIS
-    if not found_nyssis and m_fname and m_lname and len(m_fname)>1 and len(m_lname)>1:
-        found_nyssis = name_to_nyssis.get((m_fname, m_lname))
-
-    # Try 3: Last + DOB → NYSSIS
-    if not found_nyssis and m_lname and m_dob and len(m_lname)>1:
-        found_nyssis = lastdob_to_nyssis.get((m_lname, m_dob))
-
-    # Try 4: First + DOB → NYSSIS (unique only)
-    if not found_nyssis and m_fname and m_dob and len(m_fname)>1:
-        found_nyssis = firstdob_to_nyssis.get((m_fname, m_dob))
-
-    if found_nyssis:
-        unified.at[idx, "NYSSIS ID"] = found_nyssis
-        nyssis_patch_count += 1
-
-still_missing_nyssis = int((unified["NYSSIS ID"].isna() | (unified["NYSSIS ID"] == "0")).sum())
-print(f"  Pass 2 — NYSSIS IDs patched from ST:   {nyssis_patch_count}")
-print(f"  Still missing NYSSIS IDs:              {still_missing_nyssis}")
-
-# ============================================================================
-# PASS 3 — Patch missing DOB and School Name from ST
-# Fixes SPED-only rows that have no Birth Date or School Name in source file
-# ============================================================================
-# Build ST lookup dicts for DOB and School keyed by sid and nyssis
-st_sid_dob    = {}
-st_sid_school = {}
-st_nys_dob    = {}
-st_nys_school = {}
-st_name_dob   = {}
-st_name_school= {}
-for _, srow in st_all.iterrows():
-    sid = srow["sid"]; nys = srow["nyssis"]
-    fn  = srow["fname"]; ln = srow["lname"]
-    dob = srow["dob"]; sch = srow["school"]
-    if pd.notna(sid):
-        if sid not in st_sid_dob    and pd.notna(dob): st_sid_dob[sid]    = dob
-        if sid not in st_sid_school and pd.notna(sch): st_sid_school[sid] = sch
-    if pd.notna(nys):
-        if nys not in st_nys_dob    and pd.notna(dob): st_nys_dob[nys]    = dob
-        if nys not in st_nys_school and pd.notna(sch): st_nys_school[nys] = sch
-    if pd.notna(fn) and pd.notna(ln):
-        key = (fn, ln)
-        if key not in st_name_dob    and pd.notna(dob): st_name_dob[key]    = dob
-        if key not in st_name_school and pd.notna(sch): st_name_school[key] = sch
-
-dob_patch_count = 0; school_patch_count = 0
-for idx, row in unified.iterrows():
-    needs_dob    = pd.isna(row["DOB"])
-    sch_val      = str(row["School Name"]) if pd.notna(row["School Name"]) else ""
-    needs_school = sch_val.strip() in ("", "nan", "NA", "0")
-    if not needs_dob and not needs_school:
-        continue
-
-    m_sid    = str(row["Student ID"]).strip()  if pd.notna(row["Student ID"])  and str(row["Student ID"]) not in ("nan","0","NA") else None
-    m_nyssis = str(row["NYSSIS ID"]).strip()   if pd.notna(row["NYSSIS ID"])   and str(row["NYSSIS ID"])  not in ("nan","0","NA") else None
-    m_fname  = str(row["First Name"]).strip().upper() if pd.notna(row["First Name"]) and str(row["First Name"]) not in ("NA","nan","0") else None
-    m_lname  = str(row["Last Name"]).strip().upper()  if pd.notna(row["Last Name"])  and str(row["Last Name"])  not in ("NA","nan","0") else None
-
-    # Find best DOB match
-    found_dob = None; found_sch = None
-    for key_val, dob_d, sch_d in [
-        (m_sid,           st_sid_dob,  st_sid_school),
-        (m_nyssis,        st_nys_dob,  st_nys_school),
-        ((m_fname,m_lname) if m_fname and m_lname else None, st_name_dob, st_name_school)
-    ]:
-        if key_val is not None:
-            if found_dob    is None and key_val in dob_d: found_dob = dob_d[key_val]
-            if found_sch    is None and key_val in sch_d: found_sch = sch_d[key_val]
-        if found_dob is not None and found_sch is not None:
-            break
-
-    if needs_dob and found_dob is not None:
-        unified.at[idx, "DOB"] = pd.Timestamp(found_dob)
-        dob_patch_count += 1
-    if needs_school and found_sch is not None:
-        unified.at[idx, "School Name"] = found_sch
-        school_patch_count += 1
-
-print(f"  Pass 3 — DOB patched from ST:          {dob_patch_count}")
-print(f"  Pass 3 — School Name patched from ST:  {school_patch_count}")
-print(f"  Still missing DOB:                     {int(unified['DOB'].isna().sum())}")
-missing_school = int((unified['School Name'].isna() | unified['School Name'].astype(str).str.strip().isin(['','nan','NA','0'])).sum())
-print(f"  Still missing School Name:             {missing_school}")
-
-# ============================================================================
-# DEDUPLICATION
-# Rule 1: Within same charter, SPED-only row shares NYSSIS with gen roster row
-#         → drop SPED-only duplicate (gen roster is authoritative)
-# Rule 2: Within same charter, true duplicate (same NYSSIS, same flag)
-#         → keep first occurrence only
-# Rule 3: Cross-charter duplicates (different charters) → KEEP BOTH
-# ============================================================================
-before_dedup = len(unified)
-
-def clean_id_s(v):
-    if pd.isna(v): return None
-    s = str(v).strip().rstrip('.0')
-    return None if s in ('','NA','NULL','0','nan') else s
-
-unified['_nyssis'] = unified['NYSSIS ID'].apply(clean_id_s)
-unified['_charter'] = unified['Charter_Source Ticket #']
-unified['_sped']    = unified['SPED_Flag'].fillna('')
-
-drop_idx = set()
-for nys, grp in unified[unified['_nyssis'].notna()].groupby('_nyssis'):
-    for charter, cgrp in grp.groupby('_charter'):
-        if len(cgrp) <= 1:
-            continue
-        flags = cgrp['_sped'].tolist()
-        has_gen  = any('not on gen roster' not in f.lower() for f in flags)
-        has_sped = any('not on gen roster'     in f.lower() for f in flags)
-        if has_gen and has_sped:
-            # Drop SPED-only rows
-            sped_rows = cgrp[cgrp['_sped'].str.lower().str.contains('not on gen roster', na=False)]
-            drop_idx.update(sped_rows.index.tolist())
-        else:
-            # Rule 2: same NYSSIS, same SPED flag — check if enroll dates differ
-            # Different enroll dates = re-enrollment (disenrolled + re-enrolled) → KEEP BOTH
-            enr_vals = cgrp['Enroll Date'].dropna().astype(str)
-            n_unique_enr = enr_vals[enr_vals != 'NaT'].nunique()
-            if n_unique_enr > 1:
-                # Re-enrollment periods — preserve all rows
-                continue
-            # True duplicates (same enroll date) — keep first row only
-            drop_idx.update(cgrp.index.tolist()[1:])
-
-unified = unified.drop(index=list(drop_idx)).reset_index(drop=True)
-unified = unified.drop(columns=['_nyssis','_charter','_sped'])
-print(f"  Dedup — duplicate rows removed:       {len(drop_idx)}")
-print(f"  Rows after dedup:                      {len(unified)}")
-
-still_missing = still_missing_sid
-n = len(unified)
-
-# Not Found in ST
-not_found = unified[
-    unified["NYSSIS ID"].isna() |
-    (unified["NYSSIS ID"] == "0") |
-    (unified["Student Status"] == "Not in ST System")
-].copy()
-
-# ============================================================================
-# VALIDATION SUMMARY
-# ============================================================================
-print(f"\n{'='*52}")
-print(f"UNIFIED ROSTER SUMMARY")
-print(f"{'='*52}")
-print(f"Total students: {n:,}")
-print("\nRows per charter:")
-print(unified.groupby("Charter_Source Ticket #").size().reset_index(name="rows").to_string(index=False))
-print("\nFTE by charter:")
-fte_summary = unified.groupby("Charter_Source Ticket #")["SCSD FTE"].sum().round(3).reset_index()
-print(fte_summary.to_string(index=False))
-print(f"\nTotal FTE: {unified['SCSD FTE'].sum():.3f}")
-missing_nyssis = int((unified["NYSSIS ID"].isna() | (unified["NYSSIS ID"] == "0")).sum())
-print(f"Missing NYSSIS: {missing_nyssis}")
-print(f"Missing Student IDs: {still_missing}")
-print(f"Not Found in ST tab: {len(not_found)} rows")
-
-# ============================================================================
-# WRITE EXCEL WITH OPENPYXL
-# ============================================================================
-from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from openpyxl.formatting.rule import ColorScaleRule, CellIsRule, FormulaRule
-
-wb = Workbook()
-wb.remove(wb.active)
-
-CLR_DARK_BLUE  = "1F3864"
-CLR_TEAL       = "17375E"
-CLR_ORANGE     = "C55A11"
-CLR_PURPLE     = "4B2D83"
-CLR_GREEN      = "375623"
-CLR_SPED_BG    = "FFF2CC"
-CLR_GENED_BG   = "E2EFDA"
-CLR_GOOD_BG    = "C6EFCE"
-CLR_GOOD_FG    = "276221"
-CLR_NOGOOD_BG  = "FFC7CE"
-CLR_NOGOOD_FG  = "9C0006"
-CLR_FLAG_BG    = "FFEB9C"
-CLR_FLAG_FG    = "9C5700"
-
-COL_WIDTHS = [18,13,34,13,12,14,12,10,12,32,12,12,9,16,28,12]
-
-def make_hdr_fill(hex_color):
-    return PatternFill("solid", fgColor=hex_color)
-
-def make_hdr_font(bold=True):
-    return Font(bold=bold, color="FFFFFF")
-
-def style_header_row(ws, row_num, num_cols, fill_hex):
-    fill = make_hdr_fill(fill_hex)
-    font = make_hdr_font()
-    for c in range(1, num_cols+1):
-        cell = ws.cell(row=row_num, column=c)
-        cell.fill = fill
-        cell.font = font
-        cell.alignment = Alignment(horizontal="left", wrap_text=False)
+from openpyxl.formatting.rule import CellIsRule, Rule
+from openpyxl.styles.differential import DifferentialStyle
+from datetime import datetime, date
+from collections import defaultdict
+import xml.etree.ElementTree as ET
+
+BASE = "/home/user/workspace/uploaded_attachments/8dc6b308dcc94470ad3ac69527bb318b/"
+OUT  = "/home/user/workspace/all_charters_unified_roster_25-26_REBUILT.xlsx"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+def sv(v):
+    if v is None: return ''
+    return str(v).replace('.0','').strip()
+
+def dv(v):
+    if v is None: return None
+    if isinstance(v, datetime): return v.date()
+    if isinstance(v, date):     return v
+    return None
+
+DATE_FMT = 'mm/dd/yyyy'
+DATE_COLS = {2, 9, 11, 12}   # Charter Month, DOB, Enroll Date, Withdraw Date
+
+# ── load one ST export ────────────────────────────────────────────────────────
+def load_st(path):
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb['ST Enroll Export']
+    h  = [ws.cell(1,c).value for c in range(1, ws.max_column+1)]
+    rows = []
+    for r in range(2, ws.max_row+1):
+        row = {h[i]: ws.cell(r, i+1).value for i in range(len(h))}
+        if any(row.get(k) for k in ['Student_UniversalStudentID','StudentID','FirstName']):
+            rows.append(row)
+    return rows
+
+print("Loading ST Enroll from all 4 charters...")
+all_st_raw = []
+for f in ["southside_291462_unified-roster.xlsx",
+          "sas_291463_unified-roster.xlsx",
+          "sasccs_291464_unified-roster.xlsx",
+          "ontech_final_unified-roster.xlsx"]:
+    rows = load_st(BASE + f)
+    all_st_raw.extend(rows)
+    print(f"  {f}: {len(rows)} ST rows")
+
+# deduplicate on NYSSIS+SID+StartDate+School
+seen_keys = set()
+combined_st = []
+for row in all_st_raw:
+    nyssis = sv(row.get('Student_UniversalStudentID'))
+    sid    = sv(row.get('StudentID'))
+    start  = str(row.get('StudentEnrollment_StartDate') or '')[:10]
+    school = sv(row.get('SchoolName'))
+    key    = f"{nyssis}|{sid}|{start}|{school}"
+    if key not in seen_keys:
+        seen_keys.add(key)
+        combined_st.append(row)
+
+print(f"Combined unique ST rows: {len(combined_st)}")
+
+# ── ST lookup dicts ───────────────────────────────────────────────────────────
+st_by_nyssis = defaultdict(list)
+st_by_sid    = defaultdict(list)
+st_by_name   = defaultdict(list)
+
+for row in combined_st:
+    nyssis = sv(row.get('Student_UniversalStudentID'))
+    sid    = sv(row.get('StudentID'))
+    fname  = sv(row.get('FirstName')).upper()
+    lname  = sv(row.get('LastName')).upper()
+    if nyssis and nyssis not in ('0',''):
+        st_by_nyssis[nyssis].append(row)
+    if sid and sid not in ('0',''):
+        st_by_sid[sid].append(row)
+    if fname and lname:
+        st_by_name[(lname, fname)].append(row)
+
+# ── classify logic ────────────────────────────────────────────────────────────
+CHARTER_KW = {
+    'Southside 291462': ['southside academy'],
+    'SAS 291463':       ['syracuse academy of science','sas'],
+    'SASCCS 291464':    ['citizenship & science','citizenship and science','sasccs'],
+    'OnTech 291465':    ['ontech','on tech'],
+}
+
+def school_ok(school_str, charter):
+    sl = school_str.lower()
+    return any(kw in sl for kw in CHARTER_KW.get(charter, []))
+
+def classify(enroll_dt, withdraw_dt, st_rows, charter):
+    if not st_rows:
+        return 'Not in ST System', \
+               'Not pulling up in ST. Need more student information.'
+    charter_rows = [r for r in st_rows if school_ok(sv(r.get('SchoolName','')), charter)]
+    if not charter_rows:
+        other = sv(st_rows[0].get('SchoolName',''))
+        o_s   = dv(st_rows[0].get('StudentEnrollment_StartDate'))
+        o_e   = dv(st_rows[0].get('StudentEnrollment_EndDate'))
+        ds    = o_s.strftime('%-m/%-d/%y') if o_s else ''
+        ds   += f" - {o_e.strftime('%-m/%-d/%y')}" if o_e else ('-current' if ds else '')
+        return 'No Good', \
+               f"ST states: student started {other} {ds}.  Need charter attendance record to change in ST."
+    charter_rows.sort(
+        key=lambda r: dv(r.get('StudentEnrollment_StartDate')) or date(2000,1,1),
+        reverse=True)
+    best      = charter_rows[0]
+    st_start  = dv(best.get('StudentEnrollment_StartDate'))
+    st_end    = dv(best.get('StudentEnrollment_EndDate'))
+    st_school = sv(best.get('SchoolName',''))
+    notes, no_good = [], False
+    if enroll_dt and st_start and abs((enroll_dt - st_start).days) > 3:
+        no_good = True
+        diff = abs((enroll_dt - st_start).days)
+        notes.append(
+            f"ST states: student enrolled at {st_school} "
+            f"{st_start.strftime('%-m/%-d/%y')} . "
+            f"Entry date is {diff}> discrepancy. "
+            f"Need charter attendance record to change in ST.")
+    if not st_start and enroll_dt:
+        no_good = True
+        notes.append("No enrollment record in ST. Need charter attendance record to change in ST.")
+    if withdraw_dt and not st_end:
+        notes.append(
+            f"Charter has exit date {withdraw_dt.strftime('%-m/%-d/%y')} "
+            f"but no ST exit — this will update in ST.")
+    if withdraw_dt and st_end and abs((withdraw_dt - st_end).days) > 3:
+        no_good = True
+        notes.append(
+            f"Charter exit {withdraw_dt.strftime('%-m/%-d/%y')} does not match "
+            f"ST exit {st_end.strftime('%-m/%-d/%y')}. This will update in ST.")
+    return ('No Good' if no_good else 'Good'), (' '.join(notes) if notes else None)
+
+# ── load existing output ──────────────────────────────────────────────────────
+print("Loading existing output file...")
+wb_src = openpyxl.load_workbook(OUT, data_only=True)
+ws_src = wb_src['All Charters Unified']
+headers = [ws_src.cell(1,c).value for c in range(1, ws_src.max_column+1)]
+col = {h: i for i,h in enumerate(headers) if h}  # 0-based
+
+I_CHARTER  = col['Charter_Source Ticket #']
+I_NYSSIS   = col['NYSSIS ID']
+I_SID      = col['Student ID']
+I_LNAME    = col['Last Name']
+I_FNAME    = col['First Name']
+I_SCHOOL   = col['School Name']
+I_STATUS   = col['Student Status']
+I_NOTES    = col['Notes for Patrick']
+I_ENROLL   = col['Enroll Date']
+I_WITHDRAW = col['Withdraw Date']
+I_SPED     = col['SPED_Flag']
+
+# read all data rows
+data = []
+for r in range(2, ws_src.max_row+1):
+    row = [ws_src.cell(r,c).value for c in range(1, ws_src.max_column+1)]
+    if not any(row): continue
+    data.append(row)
+
+print(f"  Loaded {len(data)} data rows")
+
+# ── apply patches ─────────────────────────────────────────────────────────────
+print("Patching data...")
+fixes = defaultdict(int)
+
+for row in data:
+    charter  = sv(row[I_CHARTER])
+    nyssis   = sv(row[I_NYSSIS])
+    sid      = sv(row[I_SID])
+    lname    = sv(row[I_LNAME])
+    fname    = sv(row[I_FNAME])
+    school   = sv(row[I_SCHOOL])
+    status   = sv(row[I_STATUS])
+    enroll   = dv(row[I_ENROLL])
+    withdraw = dv(row[I_WITHDRAW])
+
+    # find ST match
+    st_rows = []
+    if nyssis and nyssis not in ('0','','Not Found'):
+        st_rows = st_by_nyssis.get(nyssis, [])
+    if not st_rows and sid and sid not in ('0','','Not Found'):
+        st_rows = st_by_sid.get(sid, [])
+    if not st_rows and fname and lname:
+        st_rows = st_by_name.get((lname.upper(), fname.upper()), [])
+
+    # 1. Fix NYSSIS = 0 / blank / Not Found
+    if nyssis in ('0','','Not Found') and st_rows:
+        found = sv(st_rows[0].get('Student_UniversalStudentID',''))
+        if found and found not in ('0',''):
+            row[I_NYSSIS] = found
+            nyssis = found
+            fixes['nyssis'] += 1
+
+    # 2. Fix blank Last Name (stored as "0" in source)
+    if lname in ('0','','None') and st_rows:
+        found = sv(st_rows[0].get('LastName',''))
+        if found:
+            row[I_LNAME] = found
+            fixes['lname'] += 1
+
+    # 3. Fix blank School Name
+    if not school or school in ('0','','None'):
+        if st_rows:
+            crows = [r for r in st_rows if school_ok(sv(r.get('SchoolName','')), charter)]
+            if crows:
+                found = sv(crows[0].get('SchoolName',''))
+                if found:
+                    row[I_SCHOOL] = found
+                    school = found
+                    fixes['school'] += 1
+
+    # 4. Fix blank Student ID (mainly SASCCS)
+    if not sid or sid in ('0','','Not Found','None'):
+        if st_rows:
+            found = sv(st_rows[0].get('StudentID',''))
+            if found and found not in ('0',''):
+                row[I_SID] = found
+                sid = found
+                fixes['sid'] += 1
+
+    # 5. Fix blank Student Status (OnTech 249 rows + 3 SS rows)
+    if not status or status in ('','None','NA'):
+        new_status, new_notes = classify(enroll, withdraw, st_rows, charter)
+        row[I_STATUS] = new_status
+        if new_notes and sv(row[I_NOTES]) in ('','None','NA'):
+            row[I_NOTES] = new_notes
+        fixes['status'] += 1
+
+print(f"  Patches: {dict(fixes)}")
+
+# ── count issues remaining for verification ───────────────────────────────────
+remaining = defaultdict(int)
+from collections import Counter
+status_counts = defaultdict(Counter)
+for row in data:
+    charter = sv(row[I_CHARTER])
+    nyssis  = sv(row[I_NYSSIS])
+    status  = sv(row[I_STATUS])
+    school  = sv(row[I_SCHOOL])
+    sid     = sv(row[I_SID])
+    lname   = sv(row[I_LNAME])
+    status_counts[charter][status] += 1
+    if not nyssis or nyssis in ('0','Not Found','None'): remaining['nyssis_bad'] += 1
+    if not status or status in ('','None','NA'):          remaining['status_blank'] += 1
+    if not school or school in ('0','','None'):           remaining['school_blank'] += 1
+    if not sid or sid in ('0','Not Found','None',''):     remaining['sid_bad'] += 1
+    if not lname or lname in ('0','','None'):             remaining['lname_bad'] += 1
+
+print(f"\nRemaining issues after patch: {dict(remaining)}")
+print("\nStatus breakdown by charter:")
+for charter in sorted(status_counts):
+    print(f"  {charter}:")
+    for st, cnt in sorted(status_counts[charter].items()):
+        print(f"    {cnt:4d}  {st}")
+
+# ── styles ────────────────────────────────────────────────────────────────────
+DARK   = PatternFill('solid', fgColor='1F3864')
+TEAL   = PatternFill('solid', fgColor='17375E')
+ORANGE = PatternFill('solid', fgColor='C55A11')
+PURPLE = PatternFill('solid', fgColor='4B2D83')
+GREEN  = PatternFill('solid', fgColor='375623')
+NAVY   = PatternFill('solid', fgColor='203864')
+
+GOOD_FILL   = PatternFill('solid', fgColor='C6EFCE')
+NOGOOD_FILL = PatternFill('solid', fgColor='FFC7CE')
+SPED_FILL   = PatternFill('solid', fgColor='FFF2CC')
+GENED_FILL  = PatternFill('solid', fgColor='E2EFDA')
+FLAG_FILL   = PatternFill('solid', fgColor='FFEB9C')
+
+WHITE_BOLD  = Font(bold=True, color='FFFFFF')
+GOOD_FONT   = Font(color='276221')
+NOGOOD_FONT = Font(color='9C0006')
+FLAG_FONT   = Font(color='9C5700', bold=True)
+
+COL_W = [18,13,34,13,12,14,12,10,12,32,12,12,9,16,52,12]
+
+def hdr_cell(ws, r, c, val, fill):
+    cell = ws.cell(r, c, val)
+    cell.fill = fill
+    cell.font = WHITE_BOLD
+    cell.alignment = Alignment(horizontal='left')
+    return cell
+
+def color_row(ws, r_idx, row):
+    """Apply status and SPED colors to a data row (r_idx is 1-based sheet row)."""
+    status = sv(row[I_STATUS])
+    sped   = sv(row[I_SPED])
+    # Status col (col 14 = index 13 = I_STATUS, 1-based = 14)
+    sc = I_STATUS + 1
+    if 'No Good' in status:
+        ws.cell(r_idx, sc).fill = NOGOOD_FILL
+        ws.cell(r_idx, sc).font = NOGOOD_FONT
+    elif status == 'Good':
+        ws.cell(r_idx, sc).fill = GOOD_FILL
+        ws.cell(r_idx, sc).font = GOOD_FONT
+    # SPED col (col 16)
+    pc = I_SPED + 1
+    if 'SPED' in sped:    ws.cell(r_idx, pc).fill = SPED_FILL
+    elif 'Gen Ed' in sped: ws.cell(r_idx, pc).fill = GENED_FILL
+
+def write_data_row(ws, r_idx, row):
+    for c_idx, val in enumerate(row, 1):
+        cell = ws.cell(r_idx, c_idx, val)
+        if c_idx in DATE_COLS and val is not None:
+            cell.number_format = DATE_FMT
+    color_row(ws, r_idx, row)
 
 def set_col_widths(ws, widths):
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
+    for c, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(c)].width = w
 
-def write_df_to_sheet(ws, df, start_row=1, include_header=True):
-    if include_header:
-        for c_idx, col_name in enumerate(df.columns, 1):
-            ws.cell(row=start_row, column=c_idx, value=col_name)
-        start_row += 1
-    for r_idx, row in enumerate(df.itertuples(index=False), start_row):
-        for c_idx, val in enumerate(row, 1):
-            cell = ws.cell(row=r_idx, column=c_idx)
-            if not isinstance(val, str) and pd.isna(val):
-                cell.value = None
-            elif isinstance(val, pd.Timestamp):
-                cell.value = val.to_pydatetime() if not pd.isna(val) else None
-                cell.number_format = "MM/DD/YYYY"
-            else:
-                cell.value = val
-    return start_row + len(df) - 1
+n = len(data)
 
-def apply_sped_status_cf(ws, data_rows, sped_col=16, status_col=14):
-    sc = get_column_letter(sped_col)
-    stc = get_column_letter(status_col)
-    sped_range   = f"{sc}2:{sc}{data_rows+1}"
-    status_range = f"{stc}2:{stc}{data_rows+1}"
-    ws.conditional_formatting.add(sped_range,
-        FormulaRule(formula=[f'NOT(ISERROR(SEARCH("SPED",{sc}2)))'],
-                    fill=PatternFill("solid", fgColor=CLR_SPED_BG)))
-    ws.conditional_formatting.add(sped_range,
-        FormulaRule(formula=[f'NOT(ISERROR(SEARCH("Gen Ed",{sc}2)))'],
-                    fill=PatternFill("solid", fgColor=CLR_GENED_BG)))
-    ws.conditional_formatting.add(status_range,
-        FormulaRule(formula=[f'NOT(ISERROR(SEARCH("No Good",{stc}2)))'],
-                    fill=PatternFill("solid", fgColor=CLR_NOGOOD_BG),
-                    font=Font(color=CLR_NOGOOD_FG)))
-    ws.conditional_formatting.add(status_range,
-        FormulaRule(formula=[f'=AND(NOT(ISERROR(SEARCH("Good",{stc}2))),ISERROR(SEARCH("No Good",{stc}2)))'],
-                    fill=PatternFill("solid", fgColor=CLR_GOOD_BG),
-                    font=Font(color=CLR_GOOD_FG)))
+# ── build workbook ────────────────────────────────────────────────────────────
+print("\nBuilding workbook...")
+wb = openpyxl.Workbook()
+wb.remove(wb.active)
 
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — All Charters Unified
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════════════
 ws1 = wb.create_sheet("All Charters Unified")
-write_df_to_sheet(ws1, unified, start_row=1, include_header=True)
-style_header_row(ws1, 1, len(TEMPLATE_COLS), CLR_DARK_BLUE)
-ws1.freeze_panes = "A2"
-set_col_widths(ws1, COL_WIDTHS)
-apply_sped_status_cf(ws1, n)
+for c, h in enumerate(headers, 1):
+    hdr_cell(ws1, 1, c, h, DARK)
+for r_idx, row in enumerate(data, 2):
+    write_data_row(ws1, r_idx, row)
+set_col_widths(ws1, COL_W)
+ws1.freeze_panes = 'A2'
+ws1.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{n+1}"
+print(f"  Tab 1: {n} rows")
 
-# ============================================================================
-# TAB 2 — Formula Version
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 2 — Formula Version  (VLOOKUP against ST Enroll Export)
+# ════════════════════════════════════════════════════════════════════════════
+# ST Enroll Export column layout:
+#   A=NYSSIS_ID  B=Student_ID  C=Last_Name  D=First_Name  E=DOB  F=Grade
+#   G=School_Name  H=Enroll_Start  I=Enroll_End  J=Entry_Note  K=Exit_Note
+# VLOOKUP(lookup_value, 'ST Enroll Export'!$A:$K, col_index, 0)
+#   col index 1=NYSSIS, 2=SID, 3=Last, 4=First, 5=DOB, 7=School
+
 ws2 = wb.create_sheet("Formula Version")
-fv_cols = TEMPLATE_COLS + ["Resolved_NYSSIS", "Match_Source"]
-for c_idx, col_name in enumerate(fv_cols, 1):
-    ws2.cell(row=1, column=c_idx, value=col_name)
-style_header_row(ws2, 1, len(fv_cols), CLR_TEAL)
-write_df_to_sheet(ws2, unified, start_row=2, include_header=False)
-for i in range(2, n+2):
-    ws2.cell(row=i, column=17).value = (
-        f'=IF(AND(E{i}<>"",E{i}<>"Not Found",NOT(ISBLANK(E{i}))),'
-        f'IFERROR(INDEX(\'Update Log\'!$A:$A,MATCH(E{i},\'Update Log\'!$B:$B,0)),D{i}),D{i})'
-    )
-    ws2.cell(row=i, column=18).value = (
-        f'=IF(AND(E{i}<>"",E{i}<>"Not Found",NOT(ISBLANK(E{i}))),'
-        f'IF(ISNUMBER(MATCH(E{i},\'Update Log\'!$B:$B,0)),"Update Log","Master Roster"),"No Student ID")'
-    )
-ws2.freeze_panes = "A2"
-set_col_widths(ws2, COL_WIDTHS + [16, 14])
-apply_sped_status_cf(ws2, n)
-rng18 = f"R2:R{n+1}"
-ws2.conditional_formatting.add(rng18,
-    FormulaRule(formula=['NOT(ISERROR(SEARCH("Update Log",R2)))'],
-                fill=PatternFill("solid", fgColor=CLR_FLAG_BG),
-                font=Font(color=CLR_FLAG_FG, bold=True)))
+fv_hdrs = list(headers) + ['ST_NYSSIS_Lookup', 'ST_School_Lookup',
+                            'ST_SID_Lookup', 'Match_Source']
+for c, h in enumerate(fv_hdrs, 1):
+    hdr_cell(ws2, 1, c, h, TEAL)
 
-# ============================================================================
-# TAB 3 — Copy & Paste (Values Only)
-# ============================================================================
+ST = "'ST Enroll Export'"
+
+for r_idx, row in enumerate(data, 2):
+    write_data_row(ws2, r_idx, row)
+    # Col letters in THIS sheet (Formula Version):
+    # D = NYSSIS ID (col 4), E = Student ID (col 5)
+    D = f"D{r_idx}"   # NYSSIS ID
+    E = f"E{r_idx}"   # Student ID
+
+    # Col 17: ST_NYSSIS_Lookup
+    # VLOOKUP Student ID in ST col B → return NYSSIS (col A, index 1 of B:K)
+    # Fallback: VLOOKUP NYSSIS in ST col A → return NYSSIS (confirms it exists)
+    f17 = (f"=IFERROR(VLOOKUP({E},{ST}!$B:$A,1,0),"
+           f"IFERROR(VLOOKUP({D},{ST}!$A:$A,1,0),\"Not Found\"))")
+    ws2.cell(r_idx, 17, f17)
+
+    # Col 18: ST_School_Lookup — look up NYSSIS in ST col A, return School (col 7 of A:K)
+    f18 = (f"=IFERROR(VLOOKUP({D},{ST}!$A:$K,7,0),"
+           f"IFERROR(VLOOKUP({E},{ST}!$B:$K,6,0),\"Not Found\"))")
+    ws2.cell(r_idx, 18, f18)
+
+    # Col 19: ST_SID_Lookup — look up NYSSIS in ST col A, return SID (col 2 of A:K)
+    f19 = (f"=IFERROR(VLOOKUP({D},{ST}!$A:$K,2,0),"
+           f"IFERROR(VLOOKUP({E},{ST}!$B:$B,1,0),\"Not Found\"))")
+    ws2.cell(r_idx, 19, f19)
+
+    # Col 20: Match_Source
+    f20 = (f"=IF(Q{r_idx}=\"Not Found\",\"No ST Match\","
+           f"IF(Q{r_idx}={D},\"NYSSIS Match\",\"SID Match\"))")
+    ws2.cell(r_idx, 20, f20)
+
+set_col_widths(ws2, COL_W + [15,20,12,12])
+ws2.freeze_panes = 'A2'
+print(f"  Tab 2: Formula Version written")
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 3 — Copy & Paste
+# ════════════════════════════════════════════════════════════════════════════
 ws3 = wb.create_sheet("Copy & Paste")
-instr = (f"COPY & PASTE READY  |  Select A3 through P{n+2}, "
-         f"copy, then paste as VALUES ONLY into your FY 25-26 master running tab.")
-ws3.cell(row=1, column=1, value=instr)
-ws3.merge_cells(start_row=1, start_column=1, end_row=1, end_column=16)
-ws3.cell(row=1, column=1).fill = PatternFill("solid", fgColor="FCE4D6")
-ws3.cell(row=1, column=1).font = Font(bold=True, color="843C0C")
-for c_idx, col_name in enumerate(TEMPLATE_COLS, 1):
-    ws3.cell(row=2, column=c_idx, value=col_name)
-style_header_row(ws3, 2, len(TEMPLATE_COLS), CLR_ORANGE)
-write_df_to_sheet(ws3, unified, start_row=3, include_header=False)
-ws3.freeze_panes = "A3"
-set_col_widths(ws3, COL_WIDTHS)
-apply_sped_status_cf(ws3, n)
+banner = ws3.cell(1, 1,
+    f"COPY & PASTE READY  |  Select A3:P{n+2}, copy, paste VALUES ONLY into FY 25-26 master.")
+banner.fill = PatternFill('solid', fgColor='FCE4D6')
+banner.font = Font(bold=True, color='843C0C')
+banner.alignment = Alignment(horizontal='left')
+ws3.merge_cells(f'A1:{get_column_letter(len(headers))}1')
+for c, h in enumerate(headers, 1):
+    hdr_cell(ws3, 2, c, h, ORANGE)
+for r_idx, row in enumerate(data, 3):
+    write_data_row(ws3, r_idx, row)
+set_col_widths(ws3, COL_W)
+ws3.freeze_panes = 'A3'
+print(f"  Tab 3: Copy & Paste written")
 
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════════════
 # TAB 4 — Not Found in ST
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════════════
 ws4 = wb.create_sheet("Not Found in ST")
-nf_cols = TEMPLATE_COLS + ["Action Needed"]
-not_found2 = not_found.copy()
-not_found2["Action Needed"] = not_found2.apply(lambda r: (
-    "Look up NYSSIS in SchoolTool — enter resolved NYSSIS in Update Log tab"
-    if pd.isna(r["NYSSIS ID"]) or r["NYSSIS ID"] == "0"
-    else "Student not found in ST enrollment — verify with Patrick"
-), axis=1)
-instr4 = (f"NOT FOUND IN ST  |  {len(not_found2)} students have no NYSSIS or are "
-          f"not in ST enrollment. Look up manually and add to Update Log tab.")
-ws4.cell(row=1, column=1, value=instr4)
-ws4.merge_cells(start_row=1, start_column=1, end_row=1, end_column=17)
-ws4.cell(row=1, column=1).fill = PatternFill("solid", fgColor=CLR_NOGOOD_BG)
-ws4.cell(row=1, column=1).font = Font(bold=True, color=CLR_NOGOOD_FG)
-for c_idx, col_name in enumerate(nf_cols, 1):
-    ws4.cell(row=2, column=c_idx, value=col_name)
-style_header_row(ws4, 2, len(nf_cols), CLR_PURPLE)
-write_df_to_sheet(ws4, not_found2[nf_cols], start_row=3, include_header=False)
-row_fill = PatternFill("solid", fgColor="FFE4E1")
-for r in range(3, len(not_found2)+3):
-    for c in range(1, len(nf_cols)+1):
-        ws4.cell(row=r, column=c).fill = row_fill
-ws4.freeze_panes = "A3"
-set_col_widths(ws4, COL_WIDTHS + [44])
+nf_rows = []
+for row in data:
+    nyssis = sv(row[I_NYSSIS])
+    status = sv(row[I_STATUS])
+    if not nyssis or nyssis in ('0','Not Found','None') or status == 'Not in ST System':
+        action = ('Look up NYSSIS in SchoolTool — enter in Update Log tab'
+                  if not nyssis or nyssis in ('0','Not Found','None')
+                  else 'Student not found in ST enrollment — verify with Patrick')
+        nf_rows.append(list(row) + [action])
 
-# ============================================================================
+nf_banner = ws4.cell(1, 1,
+    f"NOT FOUND IN ST  |  {len(nf_rows)} students unresolvable — look up manually.")
+nf_banner.fill = PatternFill('solid', fgColor='FFC7CE')
+nf_banner.font = Font(bold=True, color='9C0006')
+ws4.merge_cells(f'A1:{get_column_letter(len(headers)+1)}1')
+for c, h in enumerate(list(headers)+['Action Needed'], 1):
+    hdr_cell(ws4, 2, c, h, PURPLE)
+for r_idx, row in enumerate(nf_rows, 3):
+    for c_idx, val in enumerate(row, 1):
+        cell = ws4.cell(r_idx, c_idx, val)
+        if c_idx in DATE_COLS and val is not None:
+            cell.number_format = DATE_FMT
+        cell.fill = PatternFill('solid', fgColor='FFE4E1')
+set_col_widths(ws4, COL_W + [44])
+ws4.freeze_panes = 'A3'
+print(f"  Tab 4: Not Found in ST — {len(nf_rows)} rows")
+
+# ════════════════════════════════════════════════════════════════════════════
 # TAB 5 — Update Log
-# ============================================================================
+# ════════════════════════════════════════════════════════════════════════════
 ws5 = wb.create_sheet("Update Log")
-ul_cols = ["NYSSIS ID","Student ID","Last Name","First Name","DOB",
-           "Grade Level","School Name","Charter_Source Ticket #",
-           "Resolved_By","Resolved_Date","Notes"]
-instr5 = ("UPDATE LOG  |  Paste resolved NYSSIS records here from R or Python output. "
-          "Col A = NYSSIS ID | Col B = Student ID (must match master). "
-          "Formula Version tab will auto-pull resolved NYSSIS for any matching Student ID.")
-ws5.cell(row=1, column=1, value=instr5)
-ws5.merge_cells(start_row=1, start_column=1, end_row=1, end_column=11)
-ws5.cell(row=1, column=1).fill = PatternFill("solid", fgColor="E2EFDA")
-ws5.cell(row=1, column=1).font = Font(bold=True, color=CLR_GREEN)
-for c_idx, col_name in enumerate(ul_cols, 1):
-    ws5.cell(row=2, column=c_idx, value=col_name)
-style_header_row(ws5, 2, len(ul_cols), CLR_GREEN)
+ul_hdrs = ['NYSSIS ID','Student ID','Last Name','First Name','DOB',
+           'Grade Level','School Name','Charter_Source Ticket #',
+           'Resolved_By','Resolved_Date','Notes']
+ul_banner = ws5.cell(1, 1,
+    "UPDATE LOG  |  Paste resolved NYSSIS here. Col A=NYSSIS | Col B=Student ID. "
+    "Formula Version auto-pulls resolved NYSSIS for matching Student ID.")
+ul_banner.fill = PatternFill('solid', fgColor='E2EFDA')
+ul_banner.font = Font(bold=True, color='375623')
+ws5.merge_cells(f'A1:{get_column_letter(len(ul_hdrs))}1')
+for c, h in enumerate(ul_hdrs, 1):
+    hdr_cell(ws5, 2, c, h, GREEN)
+ws5.freeze_panes = 'A3'
+print(f"  Tab 5: Update Log written")
 
-# Seed with students still missing NYSSIS after both ST lookup passes
-ul_seed = unified[
-    unified["NYSSIS ID"].isna() |
-    (unified["NYSSIS ID"].astype(str).str.strip().isin(["0","Not Found","nan",""]))
-].copy()
-ul_seed["Resolved_By"]   = "Pending"
-ul_seed["Resolved_Date"] = pd.NaT
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 6 — ST Enroll Export (combined, deduplicated, VLOOKUP-ready)
+# ════════════════════════════════════════════════════════════════════════════
+ws6 = wb.create_sheet("ST Enroll Export")
+# Column layout (VLOOKUP-friendly — NYSSIS in A, SID in B):
+# A  B         C          D           E    F      G            H             I           J            K
+# NYSSIS_ID  Student_ID  Last_Name  First_Name  DOB  Grade  School_Name  Enroll_Start  Enroll_End  Entry_Note  Exit_Note
+st_out_hdrs = ['NYSSIS_ID','Student_ID','Last_Name','First_Name','DOB','Grade',
+               'School_Name','Enroll_Start','Enroll_End','Entry_Note','Exit_Note']
+st_src_keys  = ['Student_UniversalStudentID','StudentID','LastName','FirstName',
+                'Person_DOB','Grade','SchoolName',
+                'StudentEnrollment_StartDate','StudentEnrollment_EndDate',
+                'StudentEnrollment_EntryNote','StudentEnrollment_ExitNote']
 
-def get_note(row):
-    fn = str(row.get("First Name","")) if pd.notna(row.get("First Name")) else ""
-    ln = str(row.get("Last Name",""))  if pd.notna(row.get("Last Name"))  else ""
-    notes_map = {
-        "ANESSA":    "Not found in any ST export — verify enrollment with Patrick.",
-        "BOBBY":     "Not found in any ST export — verify enrollment with Patrick.",
-        "DONALD":    "No last name in source — search ST by DOB 12/07/2020.",
-        "EDWARD":    "No last name in source — search ST by DOB 03/20/2020.",
-        "KAIDEN":    "Not found in any ST export — verify enrollment with Patrick.",
-        "LILIANA":   "Not found in any ST export — verify enrollment with Patrick.",
-        "RAHMIER":   "Not found in any ST export — verify enrollment with Patrick.",
-        "XAVIER":    "Not found in any ST export — verify enrollment with Patrick.",
-        "JOHNNY":    "Not found in any ST export (Gaston LLL, Johnny) — verify enrollment with Patrick.",
-        "ATLANTIS":  "Not found in any ST export — verify enrollment with Patrick.",
-        "LENIA":     "Not found in any ST export — verify enrollment with Patrick.",
-        "ERIC":      "Not found in any ST export — verify enrollment with Patrick.",
-        "SCARLETT":  "Not found in any ST export — verify enrollment with Patrick.",
-        "MACKENZIE": "Not found in any ST export (Aldrich, Mackenzie) — verify enrollment with Patrick.",
-    }
-    return notes_map.get(fn.upper(), "Not found in any ST export — verify enrollment with Patrick.")
+st_banner = ws6.cell(1, 1,
+    "ST ENROLL EXPORT — Combined SchoolTool data all 4 charters | "
+    "VLOOKUP on Col A (NYSSIS_ID) or Col B (Student_ID) | "
+    "Daquan Morrison · Data Analyst · Syracuse City School District")
+st_banner.fill = NAVY
+st_banner.font = WHITE_BOLD
+ws6.merge_cells(f'A1:{get_column_letter(len(st_out_hdrs))}1')
 
-ul_seed["Notes"] = ul_seed.apply(get_note, axis=1)
-ul_out = ul_seed[["NYSSIS ID","Student ID","Last Name","First Name","DOB",
-                   "Grade Level","School Name","Charter_Source Ticket #",
-                   "Resolved_By","Resolved_Date","Notes"]]
-write_df_to_sheet(ws5, ul_out, start_row=3, include_header=False)
-seed_fill = PatternFill("solid", fgColor="FFFACD")
-for r in range(3, len(ul_out)+3):
-    for c in range(1, len(ul_cols)+1):
-        ws5.cell(row=r, column=c).fill = seed_fill
-ws5.freeze_panes = "A3"
-set_col_widths(ws5, [13,12,14,12,12,10,30,20,14,14,52])
+for c, h in enumerate(st_out_hdrs, 1):
+    hdr_cell(ws6, 2, c, h, NAVY)
 
-# ============================================================================
-# SAVE
-# ============================================================================
-wb.save(OUTPUT_PATH)
-print(f"\n{'='*52}")
-print(f"DONE")
-print(f"Output: {OUTPUT_PATH}")
-print(f"Tab 1 — All Charters Unified : {n:,} students")
-print(f"Tab 2 — Formula Version       : {n:,} rows + NYSSIS lookup formulas")
-print(f"Tab 3 — Copy & Paste          : {n:,} rows (values only)")
-print(f"Tab 4 — Not Found in ST       : {len(not_found2)} students flagged")
-print(f"Tab 5 — Update Log            : {len(ul_out)} pending resolution")
+ST_DATE_COLS = {5, 8, 9}
+for r_idx, st_row in enumerate(combined_st, 3):
+    for c_idx, key in enumerate(st_src_keys, 1):
+        val = st_row.get(key)
+        if key in ('Student_UniversalStudentID','StudentID'):
+            v = str(val or '').replace('.0','').strip()
+            val = v if v not in ('None','0','') else None
+        cell = ws6.cell(r_idx, c_idx, val)
+        if c_idx in ST_DATE_COLS and val is not None:
+            cell.number_format = DATE_FMT
+
+# Freeze on row 3 (row 1=banner, row 2=header, row 3+ = data)
+ws6.freeze_panes = 'A3'
+ws6.auto_filter.ref = f"A2:{get_column_letter(len(st_out_hdrs))}{len(combined_st)+2}"
+ST_COL_W = [14,12,18,14,12,7,40,13,13,45,45]
+set_col_widths(ws6, ST_COL_W)
+print(f"  Tab 6: ST Enroll Export — {len(combined_st)} rows")
+
+# ── save + strip dangling drawing refs ───────────────────────────────────────
+print("\nSaving...")
+tmp = OUT.replace('.xlsx','_tmp2.xlsx')
+wb.save(tmp)
+
+with zipfile.ZipFile(tmp,'r') as zin, zipfile.ZipFile(OUT,'w',zipfile.ZIP_DEFLATED) as zout:
+    for name in zin.namelist():
+        data_bytes = zin.read(name)
+        if name.endswith('.rels') and b'drawing' in data_bytes.lower():
+            try:
+                root = ET.fromstring(data_bytes)
+                to_rm = [el for el in root
+                         if 'drawing' in el.get('Type','').lower()
+                         or 'drawing' in el.get('Target','').lower()]
+                for el in to_rm:
+                    root.remove(el)
+                data_bytes = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                              + ET.tostring(root, encoding='unicode').encode('utf-8'))
+            except: pass
+        zout.writestr(name, data_bytes)
+
+os.remove(tmp)
+print(f"Saved: {OUT}")
+
+# ── final verification ────────────────────────────────────────────────────────
+print("\n=== FINAL VERIFICATION ===")
+wb_v = openpyxl.load_workbook(OUT, data_only=True)
+ws_v = wb_v['All Charters Unified']
+h_v  = [ws_v.cell(1,c).value for c in range(1, ws_v.max_column+1)]
+cv   = {h: i+1 for i,h in enumerate(h_v) if h}
+
+issues = defaultdict(int)
+sc_v   = defaultdict(Counter)
+for r in range(2, ws_v.max_row+1):
+    charter = sv(ws_v.cell(r, cv['Charter_Source Ticket #']).value)
+    if not charter: continue
+    nyssis  = sv(ws_v.cell(r, cv['NYSSIS ID']).value)
+    sid     = sv(ws_v.cell(r, cv['Student ID']).value)
+    school  = sv(ws_v.cell(r, cv['School Name']).value)
+    status  = sv(ws_v.cell(r, cv['Student Status']).value)
+    lname   = sv(ws_v.cell(r, cv['Last Name']).value)
+    sc_v[charter][status] += 1
+    if not nyssis or nyssis in ('0','Not Found','None'): issues['nyssis_bad']  += 1
+    if not status or status in ('','None','NA'):          issues['status_blank'] += 1
+    if not school or school in ('0','','None'):           issues['school_blank'] += 1
+    if not sid    or sid    in ('0','Not Found','None'):  issues['sid_bad']      += 1
+    if not lname  or lname  in ('0','','None'):           issues['lname_bad']    += 1
+
+print(f"Sheets: {wb_v.sheetnames}")
+print(f"Remaining issues: {dict(issues)}")
+print("\nStudent Status by charter:")
+for charter in sorted(sc_v):
+    print(f"  {charter}:")
+    for st, cnt in sorted(sc_v[charter].items()):
+        print(f"    {cnt:4d}  {st}")
+
+# Count totals
+total = sum(sum(v.values()) for v in sc_v.values())
+print(f"\nTotal rows: {total}")
