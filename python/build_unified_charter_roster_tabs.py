@@ -244,7 +244,8 @@ def load_st(filepath, sheet, source):
         "sid":    df["StudentID"].astype(str).str.strip().str.replace(r'\.0+$','',regex=True).replace(['nan','NULL',''], pd.NA),
         "fname":  df["FirstName"].astype(str).str.strip().str.upper().replace(['nan','NULL',''], pd.NA),
         "lname":  df["LastName"].astype(str).str.strip().str.upper().replace(['nan','NULL',''], pd.NA),
-        "dob":    df["Person_DOB"].astype(str).str[:10].replace(['nan','NULL','NaT'], pd.NA),
+        "dob":    pd.to_datetime(df["Person_DOB"], errors='coerce'),
+        "school": df["SchoolName"].astype(str).str.strip().replace(['nan','NULL',''], pd.NA),
         "source": source
     })
 
@@ -381,6 +382,118 @@ for idx, row in unified.iterrows():
 still_missing_nyssis = int((unified["NYSSIS ID"].isna() | (unified["NYSSIS ID"] == "0")).sum())
 print(f"  Pass 2 — NYSSIS IDs patched from ST:   {nyssis_patch_count}")
 print(f"  Still missing NYSSIS IDs:              {still_missing_nyssis}")
+
+# ============================================================================
+# PASS 3 — Patch missing DOB and School Name from ST
+# Fixes SPED-only rows that have no Birth Date or School Name in source file
+# ============================================================================
+# Build ST lookup dicts for DOB and School keyed by sid and nyssis
+st_sid_dob    = {}
+st_sid_school = {}
+st_nys_dob    = {}
+st_nys_school = {}
+st_name_dob   = {}
+st_name_school= {}
+for _, srow in st_all.iterrows():
+    sid = srow["sid"]; nys = srow["nyssis"]
+    fn  = srow["fname"]; ln = srow["lname"]
+    dob = srow["dob"]; sch = srow["school"]
+    if pd.notna(sid):
+        if sid not in st_sid_dob    and pd.notna(dob): st_sid_dob[sid]    = dob
+        if sid not in st_sid_school and pd.notna(sch): st_sid_school[sid] = sch
+    if pd.notna(nys):
+        if nys not in st_nys_dob    and pd.notna(dob): st_nys_dob[nys]    = dob
+        if nys not in st_nys_school and pd.notna(sch): st_nys_school[nys] = sch
+    if pd.notna(fn) and pd.notna(ln):
+        key = (fn, ln)
+        if key not in st_name_dob    and pd.notna(dob): st_name_dob[key]    = dob
+        if key not in st_name_school and pd.notna(sch): st_name_school[key] = sch
+
+dob_patch_count = 0; school_patch_count = 0
+for idx, row in unified.iterrows():
+    needs_dob    = pd.isna(row["DOB"])
+    sch_val      = str(row["School Name"]) if pd.notna(row["School Name"]) else ""
+    needs_school = sch_val.strip() in ("", "nan", "NA", "0")
+    if not needs_dob and not needs_school:
+        continue
+
+    m_sid    = str(row["Student ID"]).strip()  if pd.notna(row["Student ID"])  and str(row["Student ID"]) not in ("nan","0","NA") else None
+    m_nyssis = str(row["NYSSIS ID"]).strip()   if pd.notna(row["NYSSIS ID"])   and str(row["NYSSIS ID"])  not in ("nan","0","NA") else None
+    m_fname  = str(row["First Name"]).strip().upper() if pd.notna(row["First Name"]) and str(row["First Name"]) not in ("NA","nan","0") else None
+    m_lname  = str(row["Last Name"]).strip().upper()  if pd.notna(row["Last Name"])  and str(row["Last Name"])  not in ("NA","nan","0") else None
+
+    # Find best DOB match
+    found_dob = None; found_sch = None
+    for key_val, dob_d, sch_d in [
+        (m_sid,           st_sid_dob,  st_sid_school),
+        (m_nyssis,        st_nys_dob,  st_nys_school),
+        ((m_fname,m_lname) if m_fname and m_lname else None, st_name_dob, st_name_school)
+    ]:
+        if key_val is not None:
+            if found_dob    is None and key_val in dob_d: found_dob = dob_d[key_val]
+            if found_sch    is None and key_val in sch_d: found_sch = sch_d[key_val]
+        if found_dob is not None and found_sch is not None:
+            break
+
+    if needs_dob and found_dob is not None:
+        unified.at[idx, "DOB"] = pd.Timestamp(found_dob)
+        dob_patch_count += 1
+    if needs_school and found_sch is not None:
+        unified.at[idx, "School Name"] = found_sch
+        school_patch_count += 1
+
+print(f"  Pass 3 — DOB patched from ST:          {dob_patch_count}")
+print(f"  Pass 3 — School Name patched from ST:  {school_patch_count}")
+print(f"  Still missing DOB:                     {int(unified['DOB'].isna().sum())}")
+missing_school = int((unified['School Name'].isna() | unified['School Name'].astype(str).str.strip().isin(['','nan','NA','0'])).sum())
+print(f"  Still missing School Name:             {missing_school}")
+
+# ============================================================================
+# DEDUPLICATION
+# Rule 1: Within same charter, SPED-only row shares NYSSIS with gen roster row
+#         → drop SPED-only duplicate (gen roster is authoritative)
+# Rule 2: Within same charter, true duplicate (same NYSSIS, same flag)
+#         → keep first occurrence only
+# Rule 3: Cross-charter duplicates (different charters) → KEEP BOTH
+# ============================================================================
+before_dedup = len(unified)
+
+def clean_id_s(v):
+    if pd.isna(v): return None
+    s = str(v).strip().rstrip('.0')
+    return None if s in ('','NA','NULL','0','nan') else s
+
+unified['_nyssis'] = unified['NYSSIS ID'].apply(clean_id_s)
+unified['_charter'] = unified['Charter_Source Ticket #']
+unified['_sped']    = unified['SPED_Flag'].fillna('')
+
+drop_idx = set()
+for nys, grp in unified[unified['_nyssis'].notna()].groupby('_nyssis'):
+    for charter, cgrp in grp.groupby('_charter'):
+        if len(cgrp) <= 1:
+            continue
+        flags = cgrp['_sped'].tolist()
+        has_gen  = any('not on gen roster' not in f.lower() for f in flags)
+        has_sped = any('not on gen roster'     in f.lower() for f in flags)
+        if has_gen and has_sped:
+            # Drop SPED-only rows
+            sped_rows = cgrp[cgrp['_sped'].str.lower().str.contains('not on gen roster', na=False)]
+            drop_idx.update(sped_rows.index.tolist())
+        else:
+            # Rule 2: same NYSSIS, same SPED flag — check if enroll dates differ
+            # Different enroll dates = re-enrollment (disenrolled + re-enrolled) → KEEP BOTH
+            enr_vals = cgrp['Enroll Date'].dropna().astype(str)
+            n_unique_enr = enr_vals[enr_vals != 'NaT'].nunique()
+            if n_unique_enr > 1:
+                # Re-enrollment periods — preserve all rows
+                continue
+            # True duplicates (same enroll date) — keep first row only
+            drop_idx.update(cgrp.index.tolist()[1:])
+
+unified = unified.drop(index=list(drop_idx)).reset_index(drop=True)
+unified = unified.drop(columns=['_nyssis','_charter','_sped'])
+print(f"  Dedup — duplicate rows removed:       {len(drop_idx)}")
+print(f"  Rows after dedup:                      {len(unified)}")
 
 still_missing = still_missing_sid
 n = len(unified)
