@@ -239,7 +239,8 @@ mk_st <- function(df, src) {
     sid    = sub("\\.0+$","", str_trim(as.character(df[["StudentID"]]))),
     fname  = str_trim(toupper(as.character(df[["FirstName"]]))),
     lname  = str_trim(toupper(as.character(df[["LastName"]]))),
-    dob    = substr(as.character(df[["Person_DOB"]]),1,10),
+    dob    = df[["Person_DOB"]],
+    school = str_trim(as.character(df[["SchoolName"]])),
     source = src, stringsAsFactors=FALSE
   )
 }
@@ -367,6 +368,111 @@ for (i in seq_len(nrow(unified))) {
 cat(sprintf("  Pass 2 — NYSSIS IDs patched from ST:   %d\n", nyssis_patch_count))
 cat(sprintf("  Still missing NYSSIS IDs:              %d\n",
   sum(is.na(unified$`NYSSIS ID`) | unified$`NYSSIS ID`=="0")))
+
+# ============================================================================
+# PASS 3 — Patch missing DOB and School Name from ST using Student ID / NYSSIS
+# Fixes SPED-only rows that have no Birth Date or School Name in source file
+# ============================================================================
+dob_patch_count    <- 0L
+school_patch_count <- 0L
+for (i in seq_len(nrow(unified))) {
+  needs_dob    <- is.na(unified$DOB[i])
+  needs_school <- is.na(unified$`School Name`[i]) | unified$`School Name`[i] %in% c("","NA","0")
+  if (!needs_dob && !needs_school) next
+
+  m_sid    <- unified$`Student ID`[i]
+  m_nyssis <- unified$`NYSSIS ID`[i]
+  m_fname  <- str_trim(toupper(as.character(unified$`First Name`[i])))
+  m_lname  <- str_trim(toupper(as.character(unified$`Last Name`[i])))
+  if (m_fname %in% c("NA","NULL","")) m_fname <- NA_character_
+  if (m_lname %in% c("NA","NULL","")) m_lname <- NA_character_
+
+  # Find ST match: try Student ID first, then NYSSIS, then First+Last
+  st_idx <- NA_integer_
+  if (!is.na(m_sid) && m_sid != "0") {
+    idx <- which(!is.na(st_all$sid) & st_all$sid == m_sid)
+    if (length(idx)>0) st_idx <- idx[1]
+  }
+  if (is.na(st_idx) && !is.na(m_nyssis) && m_nyssis != "0") {
+    idx <- which(!is.na(st_all$nyssis) & st_all$nyssis == m_nyssis)
+    if (length(idx)>0) st_idx <- idx[1]
+  }
+  if (is.na(st_idx) && !is.na(m_fname) && !is.na(m_lname) && safe_nchar(m_fname)>1 && safe_nchar(m_lname)>1) {
+    idx <- which(!is.na(st_all$fname) & !is.na(st_all$lname) &
+                 st_all$fname==m_fname & st_all$lname==m_lname)
+    if (length(idx)>0) st_idx <- idx[1]
+  }
+
+  if (!is.na(st_idx)) {
+    if (needs_dob && !is.na(st_all$dob[st_idx])) {
+      unified$DOB[i] <- as.Date(st_all$dob[st_idx])
+      dob_patch_count <- dob_patch_count + 1L
+    }
+    if (needs_school && !is.na(st_all$school[st_idx]) && st_all$school[st_idx] != "NA") {
+      unified$`School Name`[i] <- st_all$school[st_idx]
+      school_patch_count <- school_patch_count + 1L
+    }
+  }
+}
+cat(sprintf("  Pass 3 — DOB patched from ST:          %d\n", dob_patch_count))
+cat(sprintf("  Pass 3 — School Name patched from ST:  %d\n", school_patch_count))
+cat(sprintf("  Still missing DOB:                     %d\n", sum(is.na(unified$DOB))))
+cat(sprintf("  Still missing School Name:             %d\n",
+  sum(is.na(unified$`School Name`) | unified$`School Name` %in% c("","NA","0"))))
+
+# ============================================================================
+# DEDUPLICATION
+# Rule 1: Within same charter, if a SPED-only row shares NYSSIS with a gen
+#         roster row — drop the SPED-only duplicate (gen roster is authoritative)
+# Rule 2: Within same charter, if two rows share the same NYSSIS/SID with the
+#         same SPED_Flag — keep only the first occurrence
+# Rule 3: Cross-charter duplicates (same NYSSIS, different charter) are KEPT —
+#         student is legitimately enrolled at two charter schools
+# ============================================================================
+before_dedup <- nrow(unified)
+
+clean_id_v <- function(x) { s<-sub("\\.0+$","",str_trim(as.character(x))); ifelse(s%in%c("","NA","NULL","0"),NA,s) }
+unified[["_nyssis"]] <- clean_id_v(unified[["NYSSIS ID"]])
+unified[["_charter"]] <- unified[["Charter_Source Ticket #"]]
+unified[["_sped"]]    <- coalesce(unified[["SPED_Flag"]],"")
+unified[["_drop"]]    <- FALSE
+
+# Group by charter + NYSSIS — deduplicate within each charter
+for (nys in unique(unified[["_nyssis"]][!is.na(unified[["_nyssis"]])])) {
+  idx_all <- which(!is.na(unified[["_nyssis"]]) & unified[["_nyssis"]] == nys)
+  for (charter in unique(unified[["_charter"]][idx_all])) {
+    idx_c <- idx_all[unified[["_charter"]][idx_all] == charter]
+    if (length(idx_c) <= 1) next
+    flags    <- unified[["_sped"]][idx_c]
+    has_gen  <- any(!grepl("not on gen roster", flags, ignore.case=TRUE))
+    has_sped <- any( grepl("not on gen roster", flags, ignore.case=TRUE))
+    if (has_gen && has_sped) {
+      sped_idx <- idx_c[grepl("not on gen roster", unified[["_sped"]][idx_c], ignore.case=TRUE)]
+      unified[["_drop"]][sped_idx] <- TRUE
+    } else {
+      # Rule 2: same NYSSIS, same SPED flag — but if enroll dates differ,
+      # these are re-enrollment rows (disenrolled + re-enrolled) → KEEP BOTH
+      enr_vals <- as.character(unified[["Enroll Date"]][idx_c])
+      n_unique_enr <- length(unique(enr_vals[!is.na(enr_vals) & enr_vals != "NA"]))
+      if (n_unique_enr > 1) {
+        # Different enroll dates = re-enrollment periods, keep all
+        next
+      }
+      # True duplicates (same enroll date) — keep first row only
+      unified[["_drop"]][idx_c[-1]] <- TRUE
+    }
+  }
+}
+
+drop_count <- sum(unified[["_drop"]])
+unified <- unified[!unified[["_drop"]], ]
+unified[["_drop"]]    <- NULL
+unified[["_nyssis"]]  <- NULL
+unified[["_charter"]] <- NULL
+unified[["_sped"]]    <- NULL
+
+cat(sprintf("  Dedup — duplicate rows removed:       %d\n", drop_count))
+cat(sprintf("  Rows after dedup:                      %d\n", nrow(unified)))
 
 n <- nrow(unified)
 
