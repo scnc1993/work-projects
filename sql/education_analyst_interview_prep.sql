@@ -23,26 +23,31 @@ WITH roster_rows AS (
     SELECT 'OnTech', nyssis_id, sped_student_id
     FROM monthly_ontech_roster
 ),
+schooltool_keys AS (
+    SELECT DISTINCT CAST(st_nyssis_id AS VARCHAR(50)) AS normalized_nyssis_id
+    FROM st_enrollment
+    WHERE st_nyssis_id IS NOT NULL
+),
 roster_matches AS (
     SELECT
         r.charter,
         r.nyssis_id,
         r.student_id AS roster_student_id,
-        st.studentid AS schooltool_student_id
+        st.normalized_nyssis_id AS schooltool_nyssis_id
     FROM roster_rows r
-    LEFT JOIN st_enrollment st
-        ON CAST(r.nyssis_id AS VARCHAR(50)) = CAST(st.st_nyssis_id AS VARCHAR(50))
+    LEFT JOIN schooltool_keys st
+        ON CAST(r.nyssis_id AS VARCHAR(50)) = st.normalized_nyssis_id
 )
 SELECT
     charter,
     COUNT(*) AS roster_rows,
     COUNT(DISTINCT nyssis_id) AS distinct_rostered_students,
-    COUNT(DISTINCT CASE WHEN schooltool_student_id IS NOT NULL
+    COUNT(DISTINCT CASE WHEN schooltool_nyssis_id IS NOT NULL
                         THEN nyssis_id END) AS matched_students,
-    COUNT(DISTINCT CASE WHEN schooltool_student_id IS NULL
+    COUNT(DISTINCT CASE WHEN schooltool_nyssis_id IS NULL
                         THEN nyssis_id END) AS unmatched_students,
     CAST(
-        100.0 * COUNT(DISTINCT CASE WHEN schooltool_student_id IS NOT NULL
+        100.0 * COUNT(DISTINCT CASE WHEN schooltool_nyssis_id IS NOT NULL
                                     THEN nyssis_id END)
         / NULLIF(COUNT(DISTINCT nyssis_id), 0)
         AS DECIMAL(5, 2)
